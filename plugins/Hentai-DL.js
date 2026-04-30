@@ -386,23 +386,90 @@ async function buscarHentaiLA(query) {
 
 async function obtenerUltimos() {
     const html = await fetchText(`${BASE}/`)
-    const decoded = html.replace(/\\u002F/g, '/').replace(/\\"/g, '"')
+
+    // Decodificar escapes unicode y entidades que usa SvelteKit al serializar datos
+    const decoded = html
+        .replace(/\\u002F/g, '/')
+        .replace(/\\u0022/g, '"')
+        .replace(/\\"/g, '"')
+        .replace(/&quot;/g, '"')
+        .replace(/&#34;/g, '"')
+
     const results = []
-    const re = /"slug":"([^"]+)"[^}]{0,200}?"episode":(\d+)(?:[^}]{0,200}?"title":"([^"]+)")?/g
-    let m
-    while ((m = re.exec(decoded)) !== null) {
-        const slug = m[1], episode = m[2], title = m[3] || m[1].replace(/-/g, ' ')
-        if (!results.find(r => r.slug === slug))
-            results.push({ slug, title, episode })
+
+    // ── Estrategia 1: bloques JSON embebidos (SvelteKit type="application/json") ──
+    const jsonTagRe = /<script[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi
+    let jm
+    while ((jm = jsonTagRe.exec(decoded)) !== null) {
+        try {
+            const obj = JSON.parse(jm[1])
+            const extract = (o) => {
+                if (!o || typeof o !== 'object') return
+                if (o.slug && (o.episode !== undefined || o.ep !== undefined)) {
+                    const slug = o.slug
+                    const episode = String(o.episode ?? o.ep ?? '')
+                    const title = o.title || o.name || slug.replace(/-/g, ' ')
+                    if (slug && episode && !results.find(r => r.slug === slug))
+                        results.push({ slug, title, episode })
+                }
+                for (const v of Object.values(o)) {
+                    if (Array.isArray(v)) v.forEach(extract)
+                    else if (v && typeof v === 'object') extract(v)
+                }
+            }
+            extract(obj)
+        } catch (_) {}
     }
+
+    // ── Estrategia 2: regex amplia en todo el HTML decodificado ──
     if (results.length === 0) {
-        const re2 = /href="\/media\/([^/]+)\/(\d+)"/g
-        while ((m = re2.exec(html)) !== null) {
+        // slug antes que episode
+        const re1 = /"slug"\s*:\s*"([^"]+)"[^}]{0,300}?"(?:episode|ep)"\s*:\s*(\d+)(?:[^}]{0,300}?"(?:title|name)"\s*:\s*"([^"]+)")?/g
+        let m
+        while ((m = re1.exec(decoded)) !== null) {
+            const slug = m[1], episode = String(m[2]), title = m[3] || m[1].replace(/-/g, ' ')
+            if (slug && !slug.includes('/') && !results.find(r => r.slug === slug))
+                results.push({ slug, title, episode })
+        }
+        // episode antes que slug
+        const re2 = /"(?:episode|ep)"\s*:\s*(\d+)[^}]{0,300}?"slug"\s*:\s*"([^"]+)"(?:[^}]{0,300}?"(?:title|name)"\s*:\s*"([^"]+)")?/g
+        while ((m = re2.exec(decoded)) !== null) {
+            const episode = String(m[1]), slug = m[2], title = m[3] || m[2].replace(/-/g, ' ')
+            if (slug && !slug.includes('/') && !results.find(r => r.slug === slug))
+                results.push({ slug, title, episode })
+        }
+    }
+
+    // ── Estrategia 3: links /media/slug/N en el HTML ──
+    if (results.length === 0) {
+        const re3 = /href=["']\/media\/([^/"']+)\/(\d+)["']/g
+        let m
+        while ((m = re3.exec(html)) !== null) {
             const slug = m[1], episode = m[2]
             if (!results.find(r => r.slug === slug))
                 results.push({ slug, title: slug.replace(/-/g, ' '), episode })
         }
     }
+
+    // ── Estrategia 4: cheerio sobre cards de episodios ──
+    if (results.length === 0) {
+        const $ = cheerio.load(html)
+        $('a[href*="/media/"]').each((_, el) => {
+            const href = $(el).attr('href') || ''
+            const parts = href.match(/\/media\/([^/]+)\/(\d+)/)
+            if (!parts) return
+            const slug = parts[1], episode = parts[2]
+            if (/^\d+$/.test(slug)) return
+            const title =
+                $(el).find('[class*="title"], h3, h2, p').first().text().trim() ||
+                $(el).attr('title') ||
+                slug.replace(/-/g, ' ')
+            if (!results.find(r => r.slug === slug))
+                results.push({ slug, title, episode })
+        })
+    }
+
+    console.log(`[HLATEST] ${results.length} resultados encontrados`)
     return results.slice(0, 10)
 }
 
@@ -560,10 +627,10 @@ async function descargarYEnviar(m, conn, mediaUrl, title, episodio, updateStatus
         return updateStatus(`❌ No se encontraron links de descarga.\n🔗 ${mediaUrl}`)
     }
 
-    // Lista priorizada de servidores a intentar
+    // Lista priorizada de servidores a intentar (MediaFire primero)
     const servidores = [
-        ...links.mega.map(u => ({ tipo: 'mega', url: u })),
         ...links.mediafire.map(u => ({ tipo: 'mediafire', url: u })),
+        ...links.mega.map(u => ({ tipo: 'mega', url: u })),
         ...links.fireload.map(u => ({ tipo: 'fireload', url: u })),
         ...links.fichier.map(u => ({ tipo: '1fichier', url: u })),
         ...links.mp4upload.map(u => ({ tipo: 'mp4upload', url: u })),
