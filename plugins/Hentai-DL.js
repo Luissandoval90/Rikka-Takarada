@@ -10,27 +10,25 @@ import fetch from 'node-fetch'
 import { prepareWAMessageMedia, generateWAMessageFromContent, getDevice } from '@whiskeysockets/baileys'
 import * as cheerio from 'cheerio'
 import { File as MegaFile } from 'megajs'
-import { lookup as mimeLookup } from 'mime-types'
 import { pipeline } from 'stream/promises'
-import { PassThrough } from 'stream'
 import { performance } from 'perf_hooks'
 import fs from 'fs'
 import path from 'path'
 import { tmpdir } from 'os'
 import https from 'https'
+import axios from 'axios'
+import puppeteerExtra from 'puppeteer-extra'
+import StealthPlugin from 'puppeteer-extra-plugin-stealth'
 
-let puppeteerExtraInstance = null
-async function getPuppeteerExtra() {
-    if (!puppeteerExtraInstance) {
-        const [{ default: puppeteerExtra }, { default: StealthPlugin }] = await Promise.all([
-            import('puppeteer-extra'),
-            import('puppeteer-extra-plugin-stealth'),
-        ])
-        puppeteerExtra.use(StealthPlugin())
-        puppeteerExtraInstance = puppeteerExtra
-    }
-    return puppeteerExtraInstance
+// Helper: fetch con timeout usando AbortController (compatible con node-fetch v3)
+function fetchWithTimeout(url, options = {}, ms = 20000) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), ms)
+    return fetch(url, { ...options, signal: controller.signal })
+        .finally(() => clearTimeout(timer))
 }
+
+puppeteerExtra.use(StealthPlugin())
 
 const httpsAgent = new https.Agent({ keepAlive: true, maxFreeSockets: 10 })
 global.activeDownloads = global.activeDownloads || new Map()
@@ -135,15 +133,18 @@ _${descripcion}_
 // ─── Fetch helpers ─────────────────────────────────────────────────────────
 
 async function fetchText(url) {
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
         headers: { 'User-Agent': UA, 'Accept-Language': 'es-419,es;q=0.9' },
-        agent: httpsAgent, timeout: 20000,
-    })
+        agent: httpsAgent,
+    }, 20000)
     return res.text()
 }
 
 async function fetchBuffer(url) {
-    const res = await fetch(url, { headers: { 'User-Agent': UA }, agent: httpsAgent, timeout: 20000 })
+    const res = await fetchWithTimeout(url, {
+        headers: { 'User-Agent': UA },
+        agent: httpsAgent,
+    }, 20000)
     return res.buffer()
 }
 
@@ -220,10 +221,9 @@ async function buscarPorAPI(query) {
     ]
     for (const url of endpoints) {
         try {
-            const res = await fetch(url, {
+            const res = await fetchWithTimeout(url, {
                 headers: { 'User-Agent': UA, 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-                timeout: 8000,
-            })
+            }, 8000)
             if (!res.ok) continue
             const ct = res.headers.get('content-type') || ''
             if (!ct.includes('json')) continue
@@ -244,10 +244,9 @@ async function buscarPorAPI(query) {
 
 async function buscarPorFetch(query) {
     try {
-        const res = await fetch(`${BASE}/busqueda?q=${encodeURIComponent(query)}`, {
+        const res = await fetchWithTimeout(`${BASE}/busqueda?q=${encodeURIComponent(query)}`, {
             headers: { 'User-Agent': UA, 'Accept-Language': 'es-419,es;q=0.9' },
-            timeout: 15000,
-        })
+        }, 15000)
         const html = await res.text()
         const decoded = html.replace(/\\u002F/g, '/').replace(/\\"/g, '"')
 
@@ -296,7 +295,6 @@ async function buscarConPuppeteer(query) {
         throw new Error('Chromium no disponible en el sistema (instala con: apt install chromium-browser)')
     }
 
-    const puppeteerExtra = await getPuppeteerExtra()
     const browser = await puppeteerExtra.launch({
         headless: 'new',
         executablePath: execPath,
@@ -354,9 +352,9 @@ async function buscarHentaiLA(query) {
     const variaciones = generarSlugVariaciones(query)
     for (const slug of variaciones) {
         try {
-            const res = await fetch(`${BASE}/media/${slug}`, {
-                method: 'HEAD', headers: { 'User-Agent': UA }, timeout: 6000,
-            })
+            const res = await fetchWithTimeout(`${BASE}/media/${slug}`, {
+                method: 'HEAD', headers: { 'User-Agent': UA },
+            }, 6000)
             if (res.status === 200) {
                 console.log(`[SLUG] ✅ Encontrado directo: ${slug}`)
                 return [{ slug, title: slug.replace(/-/g, ' ') }]
@@ -442,7 +440,7 @@ async function obtenerLinksDescarga(mediaUrl) {
 // ─── Resolver MediaFire → URL directa ────────────────────────────────────
 
 async function resolverMediafire(url) {
-    const res = await fetch(url, { headers: { 'User-Agent': UA }, timeout: 15000 })
+    const res = await fetchWithTimeout(url, { headers: { 'User-Agent': UA } }, 15000)
     const html = await res.text()
     const $ = cheerio.load(html)
     const direct =
@@ -458,7 +456,7 @@ async function resolverMediafire(url) {
 // ─── Resolver FireLoad → URL directa ─────────────────────────────────────
 
 async function resolverFireload(url) {
-    const res = await fetch(url, { headers: { 'User-Agent': UA }, timeout: 15000 })
+    const res = await fetchWithTimeout(url, { headers: { 'User-Agent': UA } }, 15000)
     const html = await res.text()
     const direct =
         html.match(/href="(https?:\/\/[^"]*fireload\.com\/d\/[^"]+)"/)?.[1] ||
@@ -472,12 +470,11 @@ async function resolverFireload(url) {
 
 async function resolver1fichier(url) {
     // 1Fichier requiere POST para obtener link directo
-    const res = await fetch('https://api.1fichier.com/v1/download/get_token.cgi', {
+    const res = await fetchWithTimeout('https://api.1fichier.com/v1/download/get_token.cgi', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
         body: JSON.stringify({ url }),
-        timeout: 15000,
-    })
+    }, 15000)
     const json = await res.json().catch(() => null)
     const direct = json?.download_url || null
     return { direct, name: json?.filename || 'video.mp4' }
@@ -486,7 +483,7 @@ async function resolver1fichier(url) {
 // ─── Resolver MP4Upload → URL directa ────────────────────────────────────
 
 async function resolverMp4upload(url) {
-    const res = await fetch(url, { headers: { 'User-Agent': UA }, timeout: 15000 })
+    const res = await fetchWithTimeout(url, { headers: { 'User-Agent': UA } }, 15000)
     const html = await res.text()
     const direct =
         html.match(/file:\s*"([^"]+\.mp4[^"]*)"/)?.[1] ||
@@ -499,13 +496,12 @@ async function resolverMp4upload(url) {
 // ─── Descarga genérica por URL directa ───────────────────────────────────
 
 async function descargarDirecto(directUrl, fileName, tempPath, updateStatus, label) {
-    const head = await fetch(directUrl, { method: 'HEAD', headers: { 'User-Agent': UA }, timeout: 10000 })
+    const head = await fetchWithTimeout(directUrl, { method: 'HEAD', headers: { 'User-Agent': UA } }, 10000)
     const sizeBytes = parseInt(head.headers.get('content-length') || '0')
     const sizeH = sizeBytes ? (sizeBytes / 1048576).toFixed(2) + ' MB' : '?'
 
     await updateStatus(`📥 *${label}:* ${fileName}\n⚖️ *Peso:* ${sizeH}\n⏬ _Descargando..._`)
 
-    const { default: axios } = await import('axios')
     const response = await axios({
         method: 'get', url: directUrl, responseType: 'stream',
         headers: { 'User-Agent': UA }, httpsAgent,
@@ -632,7 +628,7 @@ async function descargarYEnviar(m, conn, mediaUrl, title, episodio, updateStatus
 
             } else if (srv.tipo === 'yourupload') {
                 // YourUpload generalmente tiene embed con src directo
-                const res = await fetch(srv.url, { headers: { 'User-Agent': UA }, timeout: 15000 })
+                const res = await fetchWithTimeout(srv.url, { headers: { 'User-Agent': UA } }, 15000)
                 const html = await res.text()
                 const direct = html.match(/file:\s*"([^"]+)"/)?.[1] || html.match(/src="([^"]+\.mp4[^"]*)"/)?.[1]
                 if (!direct) throw new Error('No se pudo resolver YourUpload')
@@ -666,25 +662,15 @@ async function descargarYEnviar(m, conn, mediaUrl, title, episodio, updateStatus
         await updateStatus(`✅ *Descarga completa!*\n📤 _Enviando a WhatsApp..._`)
         console.log('[BOT] Subiendo...')
 
-        const stats = fs.statSync(tempPath)
-        let uploaded = 0, start = performance.now()
-        const ps = new PassThrough()
-        ps.on('data', chunk => {
-            uploaded += chunk.length
-            const elapsed = (performance.now() - start) / 1000
-            const speed = (uploaded / 1048576 / Math.max(elapsed, 0.1)).toFixed(2)
-            process.stdout.write(`\r[WA] ⬆️ ${((uploaded / stats.size) * 100).toFixed(1)}% | ${speed} MB/s`)
-        })
-        fs.createReadStream(tempPath).pipe(ps)
-
         // Renombrar al formato limpio: "01 Titulo.mp4"
         const epNum = String(episodio).padStart(2, '0')
         const cleanTitle = title.replace(/[/\\:*?"<>|]/g, '').trim()
         const finalName = `${epNum} ${cleanTitle}.mp4`
 
-        // Msg 3: el archivo
+        // Msg 3: el archivo — usar buffer (Baileys no soporta rutas locales en `url`)
+        const fileBuffer = fs.readFileSync(tempPath)
         await conn.sendMessage(m.chat, {
-            document: { url: tempPath },
+            document: fileBuffer,
             fileName: finalName,
             mimetype: 'video/mp4',
             caption:
@@ -792,9 +778,9 @@ const handler = async (m, { conn, text, usedPrefix, command }) => {
         const slugIntent = cleanQuery.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
 
         // ── Intento directo por slug ───────────────────────────────────────
-        const direct = await fetch(`${BASE}/media/${slugIntent}`, {
-            method: 'HEAD', headers: { 'User-Agent': UA }, timeout: 8000,
-        }).catch(() => ({ status: 0 }))
+        const direct = await fetchWithTimeout(`${BASE}/media/${slugIntent}`, {
+            method: 'HEAD', headers: { 'User-Agent': UA },
+        }, 8000).catch(() => ({ status: 0 }))
 
         let info = null
 
