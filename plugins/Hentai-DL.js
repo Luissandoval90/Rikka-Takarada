@@ -291,8 +291,8 @@ async function buscarConPuppeteer(query) {
         if (fs.existsSync(p)) { execPath = p; break }
     }
     if (!execPath) {
-        console.error('[puppeteer] Chromium no encontrado. Instálalo con: apt install chromium-browser')
-        throw new Error('Chromium no disponible en el sistema (instala con: apt install chromium-browser)')
+        console.log('[puppeteer] Chromium no disponible, saltando.')
+        return []
     }
 
     const browser = await puppeteerExtra.launch({
@@ -376,18 +376,14 @@ async function buscarHentaiLA(query) {
         return fetchResults
     }
 
-    // 4. Puppeteer como último recurso
-    console.log(`[PUPPETEER] Iniciando búsqueda navegador...`)
-    const puppResults = await buscarConPuppeteer(query)
-    return puppResults
+    // 4. Sin resultados — no usar Puppeteer (requiere Chromium instalado)
+    console.log('[BUSCAR] Sin resultados con fetch/API')
+    return []
 }
 
-// ─── Últimos lanzamientos ─────────────────────────────────────────────────
+// ─── Scraping de HTML para extraer últimos lanzamientos ─────────────────────
 
-async function obtenerUltimos() {
-    const html = await fetchText(`${BASE}/`)
-
-    // Decodificar escapes unicode y entidades que usa SvelteKit al serializar datos
+function extraerUltimosDeHTML(html) {
     const decoded = html
         .replace(/\\u002F/g, '/')
         .replace(/\\u0022/g, '"')
@@ -397,7 +393,7 @@ async function obtenerUltimos() {
 
     const results = []
 
-    // ── Estrategia 1: bloques JSON embebidos (SvelteKit type="application/json") ──
+    // A: bloques JSON embebidos SvelteKit
     const jsonTagRe = /<script[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi
     let jm
     while ((jm = jsonTagRe.exec(decoded)) !== null) {
@@ -421,18 +417,16 @@ async function obtenerUltimos() {
         } catch (_) {}
     }
 
-    // ── Estrategia 2: regex amplia en todo el HTML decodificado ──
+    // B: regex amplia
     if (results.length === 0) {
-        // slug antes que episode
-        const re1 = /"slug"\s*:\s*"([^"]+)"[^}]{0,300}?"(?:episode|ep)"\s*:\s*(\d+)(?:[^}]{0,300}?"(?:title|name)"\s*:\s*"([^"]+)")?/g
+        const re1 = /"slug"\s*:\s*"([^"]+)"[^}]{0,400}?"(?:episode|ep)"\s*:\s*(\d+)(?:[^}]{0,400}?"(?:title|name)"\s*:\s*"([^"]+)")?/g
         let m
         while ((m = re1.exec(decoded)) !== null) {
             const slug = m[1], episode = String(m[2]), title = m[3] || m[1].replace(/-/g, ' ')
             if (slug && !slug.includes('/') && !results.find(r => r.slug === slug))
                 results.push({ slug, title, episode })
         }
-        // episode antes que slug
-        const re2 = /"(?:episode|ep)"\s*:\s*(\d+)[^}]{0,300}?"slug"\s*:\s*"([^"]+)"(?:[^}]{0,300}?"(?:title|name)"\s*:\s*"([^"]+)")?/g
+        const re2 = /"(?:episode|ep)"\s*:\s*(\d+)[^}]{0,400}?"slug"\s*:\s*"([^"]+)"(?:[^}]{0,400}?"(?:title|name)"\s*:\s*"([^"]+)")?/g
         while ((m = re2.exec(decoded)) !== null) {
             const episode = String(m[1]), slug = m[2], title = m[3] || m[2].replace(/-/g, ' ')
             if (slug && !slug.includes('/') && !results.find(r => r.slug === slug))
@@ -440,18 +434,19 @@ async function obtenerUltimos() {
         }
     }
 
-    // ── Estrategia 3: links /media/slug/N en el HTML ──
+    // C: links /media/slug/N
     if (results.length === 0) {
         const re3 = /href=["']\/media\/([^/"']+)\/(\d+)["']/g
         let m
         while ((m = re3.exec(html)) !== null) {
             const slug = m[1], episode = m[2]
+            if (!slug || /^\d+$/.test(slug)) continue
             if (!results.find(r => r.slug === slug))
                 results.push({ slug, title: slug.replace(/-/g, ' '), episode })
         }
     }
 
-    // ── Estrategia 4: cheerio sobre cards de episodios ──
+    // D: cheerio
     if (results.length === 0) {
         const $ = cheerio.load(html)
         $('a[href*="/media/"]').each((_, el) => {
@@ -459,51 +454,162 @@ async function obtenerUltimos() {
             const parts = href.match(/\/media\/([^/]+)\/(\d+)/)
             if (!parts) return
             const slug = parts[1], episode = parts[2]
-            if (/^\d+$/.test(slug)) return
+            if (!slug || /^\d+$/.test(slug)) return
             const title =
                 $(el).find('[class*="title"], h3, h2, p').first().text().trim() ||
-                $(el).attr('title') ||
-                slug.replace(/-/g, ' ')
+                $(el).attr('title') || slug.replace(/-/g, ' ')
             if (!results.find(r => r.slug === slug))
                 results.push({ slug, title, episode })
         })
     }
 
-    console.log(`[HLATEST] ${results.length} resultados encontrados`)
-    return results.slice(0, 10)
+    return results
 }
 
+// ─── Últimos lanzamientos ─────────────────────────────────────────────────
+
+async function obtenerUltimos() {
+    // Intento 1: __data.json de SvelteKit (API pura, sin JS)
+    try {
+        const res = await fetchWithTimeout(`${BASE}/__data.json`, {
+            headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+        }, 12000)
+        if (res.ok) {
+            const text = await res.text()
+            const results = extraerUltimosDeHTML(text)
+            console.log(`[HLATEST-DATAJSON] ${results.length} resultados`)
+            if (results.length > 0) return results.slice(0, 10)
+        }
+    } catch (_) {}
+
+    // Intento 2: fetch HTML normal + todas las estrategias de extracción
+    try {
+        const html = await fetchText(`${BASE}/`)
+        const results = extraerUltimosDeHTML(html)
+        console.log(`[HLATEST-FETCH] ${results.length} resultados`)
+        if (results.length > 0) return results.slice(0, 10)
+    } catch (err) {
+        console.error('[HLATEST-FETCH] Error:', err.message)
+    }
+
+    // Intento 3: intentar endpoint /api/latest o /api/episodes/latest
+    const apiLatestUrls = [
+        `${BASE}/api/latest`,
+        `${BASE}/api/episodes/latest`,
+        `${BASE}/api/recientes`,
+        `${BASE}/api/home`,
+    ]
+    for (const url of apiLatestUrls) {
+        try {
+            const res = await fetchWithTimeout(url, {
+                headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+            }, 8000)
+            if (!res.ok) continue
+            const ct = res.headers.get('content-type') || ''
+            if (!ct.includes('json')) continue
+            const text = await res.text()
+            const results = extraerUltimosDeHTML(text)
+            if (results.length > 0) {
+                console.log(`[HLATEST-API] ${results.length} resultados vía ${url}`)
+                return results.slice(0, 10)
+            }
+        } catch (_) {}
+    }
+
+    console.log('[HLATEST] Sin resultados en ningún endpoint')
+    return []
+}
 // ─── Links de descarga en página /media/slug/ep ──────────────────────────
-// Extrae TODOS los servidores disponibles con fallback priorizado
+// Estrategia: API JSON de SvelteKit (__data.json) primero, luego scraping HTML
 
-async function obtenerLinksDescarga(mediaUrl) {
-    const html = await fetchText(mediaUrl)
-    const decoded = html.replace(/\\u002F/g, '/').replace(/\\"/g, '"')
+function parsearLinksDeTexto(texto) {
+    const decoded = texto
+        .replace(/\\u002F/g, '/')
+        .replace(/\\u0022/g, '"')
+        .replace(/\\"/g, '"')
+        .replace(/&quot;/g, '"')
 
-    const mega = [...new Set(decoded.match(/https?:\/\/[^\s"'<\\]*mega\.nz\/file\/[^\s"'<\\]*/g) || [])]
+    const mega      = [...new Set(decoded.match(/https?:\/\/[^\s"'<\\]*mega\.nz\/file\/[^\s"'<\\]*/g) || [])]
     const mediafire = [...new Set(decoded.match(/https?:\/\/[^\s"'<\\]*mediafire\.com\/file[^\s"'<\\]*/g) || [])]
-    const fireload = [...new Set(decoded.match(/https?:\/\/[^\s"'<\\]*fireload\.com\/[^\s"'<\\]*/g) || [])]
-    const fichier = [...new Set(decoded.match(/https?:\/\/[^\s"'<\\]*1fichier\.com\/\?[^\s"'<\\]*/g) || [])]
+    const fireload  = [...new Set(decoded.match(/https?:\/\/[^\s"'<\\]*fireload\.com\/[^\s"'<\\]*/g) || [])]
+    const fichier   = [...new Set(decoded.match(/https?:\/\/[^\s"'<\\]*1fichier\.com\/\?[^\s"'<\\]*/g) || [])]
     const mp4upload = [...new Set(decoded.match(/https?:\/\/[^\s"'<\\]*mp4upload\.com\/[^\s"'<\\]*/g) || [])]
-    const yourupload = [...new Set(decoded.match(/https?:\/\/[^\s"'<\\]*yourupload\.com\/[^\s"'<\\]*/g) || [])]
-    // Catch-all: cualquier otro link de descarga genérico que no sea de la propia web
-    const otros = [...new Set(
+    const yourupload= [...new Set(decoded.match(/https?:\/\/[^\s"'<\\]*yourupload\.com\/[^\s"'<\\]*/g) || [])]
+    const otros     = [...new Set(
         (decoded.match(/https?:\/\/[^\s"'<\\]{10,}/g) || [])
             .filter(u =>
                 !u.includes(BASE) &&
-                !mega.includes(u) &&
-                !mediafire.includes(u) &&
-                !fireload.includes(u) &&
-                !fichier.includes(u) &&
-                !mp4upload.includes(u) &&
-                !yourupload.includes(u) &&
+                !mega.includes(u) && !mediafire.includes(u) &&
+                !fireload.includes(u) && !fichier.includes(u) &&
+                !mp4upload.includes(u) && !yourupload.includes(u) &&
                 /\.(mp4|mkv|avi|ts|m4v)(\?|$)/i.test(u)
             )
     )]
-
     return { mega, mediafire, fireload, fichier, mp4upload, yourupload, otros }
 }
 
+function contarLinks(links) {
+    return links.mega.length + links.mediafire.length + links.fireload.length +
+           links.fichier.length + links.mp4upload.length + links.yourupload.length + links.otros.length
+}
+
+async function obtenerLinksDescarga(mediaUrl) {
+    // ── Estrategia 1: API __data.json de SvelteKit ──────────────────────────
+    // SvelteKit expone los datos de cada ruta en <url>/__data.json
+    // Esto devuelve JSON puro sin necesitar JS en el cliente
+    try {
+        const dataUrl = mediaUrl.replace(/\/$/, '') + '/__data.json'
+        const res = await fetchWithTimeout(dataUrl, {
+            headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+        }, 12000)
+        if (res.ok) {
+            const text = await res.text()
+            const links = parsearLinksDeTexto(text)
+            if (contarLinks(links) > 0) {
+                console.log('[LINKS] ✅ Vía __data.json')
+                return links
+            }
+        }
+    } catch (_) {}
+
+    // ── Estrategia 2: fetch HTML normal + extraer JSON embebido ─────────────
+    try {
+        const html = await fetchText(mediaUrl)
+        const links = parsearLinksDeTexto(html)
+        if (contarLinks(links) > 0) {
+            console.log('[LINKS] ✅ Vía HTML scraping')
+            return links
+        }
+    } catch (_) {}
+
+    // ── Estrategia 3: endpoint alternativo de API ────────────────────────────
+    // Algunos SvelteKit exponen datos via ?_data= o similar
+    try {
+        const slug = mediaUrl.split('/media/')[1] // "nombre-serie/1"
+        const apiUrls = [
+            `${BASE}/api/media/${slug}`,
+            `${BASE}/api/episode/${slug}`,
+            `${BASE}/_api/media/${slug}`,
+        ]
+        for (const url of apiUrls) {
+            const res = await fetchWithTimeout(url, {
+                headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+            }, 8000)
+            if (!res.ok) continue
+            const ct = res.headers.get('content-type') || ''
+            if (!ct.includes('json')) continue
+            const text = await res.text()
+            const links = parsearLinksDeTexto(text)
+            if (contarLinks(links) > 0) {
+                console.log(`[LINKS] ✅ Vía API: ${url}`)
+                return links
+            }
+        }
+    } catch (_) {}
+
+    console.log('[LINKS] ⚠️ No se encontraron links de descarga (el sitio requiere JS)')
+    return { mega: [], mediafire: [], fireload: [], fichier: [], mp4upload: [], yourupload: [], otros: [] }
+}
 // ─── Resolver MediaFire → URL directa ────────────────────────────────────
 
 async function resolverMediafire(url) {
@@ -624,7 +730,11 @@ async function descargarYEnviar(m, conn, mediaUrl, title, episodio, updateStatus
         links.fichier.length + links.mp4upload.length + links.yourupload.length + links.otros.length
 
     if (totalLinks === 0) {
-        return updateStatus(`❌ No se encontraron links de descarga.\n🔗 ${mediaUrl}`)
+        return updateStatus(
+            `❌ *No se encontraron links de descarga.*\n\n` +
+            `El sitio usa JS para mostrar los links y el bot no pudo obtenerlos.\n\n` +
+            `🔗 Descárgalo manualmente:\n${mediaUrl}`
+        )
     }
 
     // Lista priorizada de servidores a intentar (MediaFire primero)
